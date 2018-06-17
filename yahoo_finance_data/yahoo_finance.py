@@ -1,70 +1,58 @@
 #!/usr/bin/env python
+from __future__ import division
 
 import re
 import time
 import datetime
 import requests
+import warnings
 import functools
 
-import warnings
 
-
+# Define coverage treshold for 
+# synchronize_price_data()
 COVERAGE_TRESHOLD = 0.9
 
-WEEKLY = "1wk"
-DAILY = "1d"
-MONTHLY = "1mo"
+# Define time intervals
+WEEKLY, DAILY, MONTHLY = "1wk", "1d", "1mo"
 
-COOKIE_CACHE, CRUMB2_CACHE = None, None
+# Some other global vars
+USE_GENERATOR = False
 USE_CACHE = True
+CACHE = {
+    "cookie" : None,
+    "crumb" : None
+}
 
 
-def find_crumb_store(lines):
-    # Looking for
-    # ,"CrumbStore":{"crumb":"9q.A4D1c.b9
-    for l in lines:
-        if re.findall(r'CrumbStore', l):
-            return l
-    print "Did not find CrumbStore"
+# We start with some utility functions:
 
 
-def get_page_data(symbol):
+def _get_www_raw(symbol):
+    ''' Downloads the cookies and the raw content of a yahoo finance page. '''
+
     url = "https://finance.yahoo.com/quote/%s/?p=%s" % (symbol, symbol)
     r = requests.get(url)
-    cookie = {'B': r.cookies['B']}
-    # lines = r.text.encode('utf-8').strip().replace('}', '\n')
-    lines = r.content.strip().replace('}', '\n')
-    return cookie, lines.split('\n')
+    return r.cookies, r.content.decode("unicode-escape")
 
 
-def get_cookie_crumb(symbol):
-    global COOKIE_CACHE, CRUMB2_CACHE
+def _to_unix_epoch(dt=None):
+    ''' Converts a datetime object into a 1970 unix epoch number. '''
 
-    if not COOKIE_CACHE or not CRUMB2_CACHE or not USE_CACHE:
-        cookie, lines = get_page_data(symbol)
-        crumb = find_crumb_store(lines).split(':')[2].strip('"')
-        # Note: possible \u002F value
-        # ,"CrumbStore":{"crumb":"FWP\u002F5EFll3U"
-        # FWP\u002F5EFll3U
-        crumb2 = crumb.decode('unicode-escape')
+    # @see https://www.linuxquestions.org/questions/programming-9/
+    # python-datetime-to-epoch-4175520007/#post5244109
     
-    return cookie, crumb2
+    if dt is None:
+        dt = datetime.datetime.now()
+
+    return int(time.mktime(dt.timetuple()))
 
 
-def get_data(symbol, start_date, end_date, cookie, crumb, event="history", interval="1d"):
-    # events: history, div, split
-    url = "https://query1.finance.yahoo.com/v7/finance/download/%s?period1=%s&period2=%s&interval=%s&events=%s&crumb=%s" % (
-        symbol, start_date, end_date, interval, event, crumb)
-    response = requests.get(url, cookies=cookie)
-    return response.text
+def _process_raw_csv(csv, target_type=float):
+    ''' Converts a raw csv string into dict. Values are converted
+        to target_type. If a value can't be converted None is 
+        inserted.'''
 
-
-def get_now_epoch():
-    # @see https://www.linuxquestions.org/questions/programming-9/python-datetime-to-epoch-4175520007/#post5244109
-    return int(time.mktime(datetime.datetime.now().timetuple()))
-
-
-def yield_raw_csv(csv, target_type=float):
     def transform(i):
         try:
             return target_type(i)
@@ -72,71 +60,163 @@ def yield_raw_csv(csv, target_type=float):
             return None
 
     lines = csv.splitlines()
+
+    # the first line always contains the labels
     labels = lines[0].split(",")
 
     for line in lines[1:]:
         values = line.split(",")
+        # the first column is always the date col
+        # we transform the string into a datetime obj
         values[0] = datetime.datetime.strptime(values[0], "%Y-%m-%d")
+
+        # the rest of the values are usually floats
         values[1:] = map(transform, values[1:])
         
         yield dict(zip(labels, values))
 
 
-def download(symbol, start_date=None, end_date=None, event="history", interval="1d"):
-    start_date = 0 if start_date is None else int(time.mktime(start_date.timetuple()))
-    end_date = end_date or get_now_epoch()
+# Now we continue with the main functions:
 
+
+def get_cookie_and_crumb(symbol):
+    ''' Extracts the specific cookie and crumb value. '''
+
+    if not all(CACHE.values()) or not USE_CACHE:
+
+        cookies, raw = _get_www_raw(symbol)
+        
+        # we try to find the crumb value using re
+        # we know that the crumb value is always 11
+        # chars long. Usually it is [a-zA-Z] but
+        # sometimes there are some confusing chars
+        # (see below)
+        try:
+            pattern = r'"CrumbStore":{"crumb":"[\w\/\.]{11}"}'
+            crumb = re.findall(pattern, raw)[0].split('"')[-2]
+        except IndexError:
+            raise RuntimeError, "Could not find crumb store. Please retry or consider updating the pattern."
+
+        # knwon unusal crumb values
+        # {"crumb":"hGjK6pd8E0\u002F"}
+        # {"crumb":"FWP\u002F5EFll3U"}
+
+        # we update the cache
+        CACHE["cookie"] = dict(B=cookies["B"])
+        CACHE["crumb"] = crumb
+
+    return CACHE["cookie"], CACHE["crumb"]
+
+
+def get_raw_csv_data(symbol, start_date, end_date, event="history", interval="1d"):
+    ''' Low level function for downloading the desired csv data (raw!).
+        I would rather recommend using the shortcut functions instead of 
+        calling get_raw_csv_data() directly. 
+    '''
+
+    cookie, crumb = get_cookie_and_crumb(symbol)
+
+    # known events: 
+    # history => historic price data
+    # div => historic dividend data
+    # split => historic split data
+
+    url = "https://query1.finance.yahoo.com/v7/finance/download/%s?period1=%s&period2=%s&interval=%s&events=%s&crumb=%s" % (
+        symbol, start_date, end_date, interval, event, crumb)
+
+    response = requests.get(url, cookies=cookie)
+    return response.text
+
+
+def download(symbol, start_date=None, end_date=None, event="history", interval="1d"):
+    ''' Medium level function  for downloading and converting the csv data.'''
+
+    if start_date is None:
+        # If not starting date is defined
+        # we start at the beginning of the unix time epoch
+        # by definition this is 0
+        start_date = 0
+    else:
+        # we transform the datetime.date object
+        # into the unix time epoch
+        start_date = _to_unix_epoch(start_date)
+
+    # we also transform the end_date...
+    end_date = _to_unix_epoch(end_date)
+
+    # some backup checks...
     assert start_date >= 0
     assert start_date <= end_date
 
-    cookie, crumb = get_cookie_crumb(symbol)
-    raw_csv = get_data(symbol, start_date, end_date, cookie, crumb, event, interval)
+    # get the raw csv
+    raw_csv = get_raw_csv_data(symbol, start_date, end_date, event, interval)
 
-    return list(yield_raw_csv(raw_csv, str if event == "split" else float))
+    final_data = _process_raw_csv(raw_csv, str if event == "split" else float)
+    return final_data if USE_GENERATOR else list(final_data)
 
 
-def synchronize_price_data(data_generator):
+def synchronized_price_data(data):
+    ''' Synchronizes multiple price series of different assets in order to 
+        align the dates. 
+    '''
 
-    date_series = [[day["Date"] for day in stock_data if day["Close"]] for stock_data in data_generator]
+    # first we compute the trading_dates of each asset
+    date_series = [[day["Date"] for day in stock_data if day["Close"]] for stock_data in data]
+
+    # then we compute the union of all trading dates
     all_dates = set(reduce(lambda a, b: a + b, date_series))
 
+    # we start filtering trading dates using set().intersection()
     common_dates = set(date_series[0])
     for date_serie in date_series[1:]:
         common_dates = common_dates.intersection(date_serie)
     
-    sync_data = [[day for day in stock_data if day["Date"] in common_dates] for stock_data in data_generator]
+    # we put all trading days together which appear in common_days
+    synced_data = [[day for day in stock_data if day["Date"] in common_dates] for stock_data in data]
 
-    coverage = (len(common_dates) / float(len(all_dates)))
-
+    # we also compute the coverage rate in order to avoid misleading results
+    coverage = len(common_dates) / len(all_dates) * 100.0
     if coverage <= COVERAGE_TRESHOLD:
         warnings.warn("Coverage treshold hit: resulting coverage is %.2f%% (%.2f%% data loss)." \
-            % (coverage * 100, (1 - coverage) * 100))
+            % (coverage, 100 - coverage))
 
-    return sync_data
+    return synced_data
 
 
-def get_synchronized_returns(sync_data):
+def get_return_vector(data, synchronize=True):
+    ''' Computes a return vector.  '''
+
     return_vector = []
 
-    for stock_data in sync_data:
-        stock_rets = []
+    # we synchronize first in order to avoid shifted return
+    # series and divisions by None
+    if synchronize:
+        data = synchronized_price_data(data)
+    else:
+        warnings.warn("'data' will not be synchronized!")
 
-        for day_nr, day in enumerate(stock_data[:-1]):
-            stock_rets.append(stock_data[day_nr + 1]["Close"] / day["Close"] - 1.0)
+    for stock in data:
+        returns = []
 
-        return_vector.append(stock_rets)
+        for day_nr, day in enumerate(stock[:-1]):
+            returns.append(stock[day_nr + 1]["Close"] / day["Close"] - 1.0)
+
+        return_vector.append(returns)
 
     return return_vector
 
 
+# Create high level shortcuts
 download_quotes = functools.partial(download, event="history")
 download_dividends = functools.partial(download, event="div")
 download_splits = functools.partial(download, event="split")
 
 
 if __name__ == "__main__":
-    universe = ["SAP.DE", "SAP.DE", "BAS.DE"]
-    data = [download_quotes(symbol, interval="1d") for symbol in universe]
-    syncd = synchronize_price_data(data)
-    RV = get_synchronized_returns(syncd)
-    print RV[0][:10]
+    
+    #import numpy
+    universe = ["ADS.DE", "SAP.DE", "BAS.DE"]
+    data = [download_quotes(symbol, interval=WEEKLY) for symbol in universe]
+    RV = get_return_vector(data)
+    #print numpy.corrcoef(RV)
+    print download_quotes("GILD", interval=WEEKLY)[-1]
