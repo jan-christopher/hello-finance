@@ -82,8 +82,8 @@ def yield_raw_csv(csv, target_type=float):
         yield dict(zip(labels, values))
 
 
-def download(symbol, start_date=0, end_date=None, event="history", interval="1d"):
-    start_date = int(time.mktime(start_date.timetuple()))
+def download(symbol, start_date=None, end_date=None, event="history", interval="1d"):
+    start_date = 0 if start_date is None else int(time.mktime(start_date.timetuple()))
     end_date = end_date or get_now_epoch()
 
     assert start_date >= 0
@@ -104,7 +104,7 @@ def synchronize_price_data(data_generator):
     for date_serie in date_series[1:]:
         common_dates = common_dates.intersection(date_serie)
     
-    sync_data = [[day for day in stock_data if day["Date"] in common_dates] for stock_data in data]
+    sync_data = [[day for day in stock_data if day["Date"] in common_dates] for stock_data in data_generator]
 
     coverage = (len(common_dates) / float(len(all_dates)))
 
