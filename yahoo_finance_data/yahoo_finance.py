@@ -11,6 +11,10 @@ import warnings
 
 COVERAGE_TRESHOLD = 0.9
 
+WEEKLY = "1wk"
+DAILY = "1d"
+MONTHLY = "1mo"
+
 COOKIE_CACHE, CRUMB2_CACHE = None, None
 USE_CACHE = True
 
@@ -79,7 +83,7 @@ def yield_raw_csv(csv, target_type=float):
 
 
 def download(symbol, start_date=0, end_date=None, event="history", interval="1d"):
-    
+    start_date = int(time.mktime(start_date.timetuple()))
     end_date = end_date or get_now_epoch()
 
     assert start_date >= 0
