@@ -110,7 +110,7 @@ def synchronize_price_data(data_generator):
 
     if coverage <= COVERAGE_TRESHOLD:
         warnings.warn("Coverage treshold hit: resulting coverage is %.2f%% (%.2f%% data loss)." \
-            % (coverage, 1 - coverage))
+            % (coverage * 100, (1 - coverage) * 100))
 
     return sync_data
 
