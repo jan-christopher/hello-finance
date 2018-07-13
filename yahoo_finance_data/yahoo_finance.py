@@ -1,4 +1,11 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+This script provides a basic access to yahoo finance data.
+
+Copyright (c) 2018, Jan-Christopher Magel
+License: MIT (see LICENSE for details)
+"""
 from __future__ import division
 
 import re
@@ -8,22 +15,29 @@ import requests
 import warnings
 import functools
 
+import pandas
+import numpy
+
+
+__author__ = 'Jan-Christopher Magel'
+__version__ = '0.12'
+__license__ = 'MIT'
 
 # Define coverage treshold for 
 # synchronize_price_data()
 COVERAGE_TRESHOLD = 0.9
+
+# should we take adjusted prices?
+ADJUST_PRICES = True
 
 # Define time intervals
 WEEKLY, DAILY, MONTHLY = "1wk", "1d", "1mo"
 
 # Some other global vars
 USE_GENERATOR = False
+GEN = lambda obj: obj if USE_GENERATOR else list(obj)
 USE_CACHE = True
-CACHE = {
-    "cookie" : None,
-    "crumb" : None
-}
-
+CACHE = dict(cookie=None, crumb=None)
 
 # We start with some utility functions:
 
@@ -76,13 +90,26 @@ def _process_raw_csv(csv, target_type=float):
         yield dict(zip(labels, values))
 
 
+def _data2pandas(data, labels, key="Close"):
+    ''' Creates a pandas dataframe for the data  '''
+
+    dates = [day["Date"] for day in data[0]]
+    key = "Adj Close" if ADJUST_PRICES else "Close"
+
+    q = [[day[key] for day in stock] for stock in data]
+    q = numpy.asarray(q)
+    df = pandas.DataFrame(q.T, index=dates, columns=labels)
+
+    return df
+
+
 # Now we continue with the main functions:
 
 
 def get_cookie_and_crumb(symbol):
     ''' Extracts the specific cookie and crumb value. '''
 
-    if not all(CACHE.values()) or not USE_CACHE:
+    if not USE_CACHE or not all(CACHE.values()):
 
         cookies, raw = _get_www_raw(symbol)
         
@@ -102,8 +129,11 @@ def get_cookie_and_crumb(symbol):
         # {"crumb":"FWP\u002F5EFll3U"}
 
         # we update the cache
-        CACHE["cookie"] = dict(B=cookies["B"])
         CACHE["crumb"] = crumb
+        # since we are just interest in the B value
+        # of the cookie we make a slimmer copy
+        CACHE["cookie"] = dict(B=cookies["B"])
+        
 
     return CACHE["cookie"], CACHE["crumb"]
 
@@ -128,34 +158,44 @@ def get_raw_csv_data(symbol, start_date, end_date, event="history", interval="1d
     return response.text
 
 
-def download(symbol, start_date=None, end_date=None, event="history", interval="1d"):
-    ''' Medium level function  for downloading and converting the csv data.'''
+def download(symbols, start_date=None, end_date=None, event="history", interval="1d"):
+    ''' Medium level function for downloading and converting the csv data.'''
 
     if start_date is None:
-        # If not starting date is defined
+        # If no starting date is defined
         # we start at the beginning of the unix time epoch
-        # by definition this is 0
+        # By definition this is 0
         start_date = 0
     else:
         # we transform the datetime.date object
         # into the unix time epoch
         start_date = _to_unix_epoch(start_date)
 
-    # we also transform the end_date...
+    # we also transform the end_date (if end_date is None
+    # we'll get the unix time epoch of today)
     end_date = _to_unix_epoch(end_date)
 
     # some backup checks...
     assert start_date >= 0
     assert start_date <= end_date
 
+    # lets check if we have multiple symbols or just one.
+    # if symbols is a string we simply make a list out of it
+    if type(symbols) == type(""):
+        symbols = [symbols]
+
     # get the raw csv
-    raw_csv = get_raw_csv_data(symbol, start_date, end_date, event, interval)
+    raw_csv = [get_raw_csv_data(s, start_date, end_date, event, interval) for s in symbols]
+    final_data = [GEN(_process_raw_csv(csv, str if event == "split" else float)) for csv in raw_csv]
 
-    final_data = _process_raw_csv(raw_csv, str if event == "split" else float)
-    return final_data if USE_GENERATOR else list(final_data)
+    if event != "history":
+        return final_data
+    else:
+        synced = synchronize(final_data)
+        return _data2pandas(synced, labels=symbols)
 
 
-def synchronized_price_data(data):
+def synchronize(data):
     ''' Synchronizes multiple price series of different assets in order to 
         align the dates. 
     '''
@@ -176,33 +216,14 @@ def synchronized_price_data(data):
 
     # we also compute the coverage rate in order to avoid misleading results
     coverage = len(common_dates) / len(all_dates)
+
     if coverage <= COVERAGE_TRESHOLD:
         warnings.warn("Coverage treshold hit: resulting coverage is %.2f%%." % (coverage * 100))
+        #lenghts = map(len, date_series)
+        #print map(len, date_series).index(min(map(len, date_series)))
 
     return synced_data
 
-
-def get_return_vector(data, synchronize=True):
-    ''' Computes a return vector.  '''
-
-    return_vector = []
-
-    # we synchronize first in order to avoid shifted return
-    # series and divisions by None
-    if synchronize:
-        data = synchronized_price_data(data)
-    else:
-        warnings.warn("'data' will not be synchronized!")
-
-    for stock in data:
-        returns = []
-
-        for day_nr, day in enumerate(stock[:-1]):
-            returns.append(stock[day_nr + 1]["Close"] / day["Close"] - 1.0)
-
-        return_vector.append(returns)
-
-    return return_vector
 
 
 # Create high level shortcuts
@@ -211,11 +232,6 @@ download_dividends = functools.partial(download, event="div")
 download_splits = functools.partial(download, event="split")
 
 
+
 if __name__ == "__main__":
-    
-    #import numpy
-    universe = ["ADS.DE", "SAP.DE", "BAS.DE"]
-    data = [download_quotes(symbol, interval=WEEKLY) for symbol in universe]
-    RV = get_return_vector(data)
-    #print numpy.corrcoef(RV)
-    print download_quotes("GILD", interval=WEEKLY)[-1]
+    print download_quotes(["GILD", "IBM"])
